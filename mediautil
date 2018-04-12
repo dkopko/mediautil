@@ -1,0 +1,561 @@
+#!/bin/bash
+
+set -o errexit
+set -o nounset
+#set -o xtrace
+
+SCRIPTNAME="$0"
+COMMAND="${1:-help}"
+
+#INDEXROOT="/home/daniel/Pictures"
+#INDEXROOT="/mnt/shared/DanPhonePictures"
+INDEXROOT="/mnt/shared/Pictures"
+THUMBNAILROOT="/mnt/shared/PicturesThumbnails"
+
+function logerr() {
+    echo "$@" 1>&2
+}
+
+
+function logop() {
+    local action="$1"
+    local srcfile="$2"
+    local destfile="$3"
+
+    echo "${action} \"${srcfile}\" -> \"${destfile}\""
+}
+
+
+# Prints the instructions for usage of this script.
+function printusage() {
+    logerr "Usage:  $(basename "$0") <command> [commandargs...]"
+    logerr "Commands:"
+    logerr "   exifdata <file> - display all EXIF data"
+    logerr "   exiffield <fieldname> <file> - display EXIF field"
+    logerr "   exiftimes <file> - display all time-related EXIF fields"
+    logerr "   importdir <dir> - recursively does importfile across all files under dir"
+    logerr "   importfile <file> - imports a file into the index at \"${INDEXROOT}\""
+    logerr "   isimported <file> - returns 0 (success) if file is already imported"
+    logerr "   mimetype <file> - display mimetype of file"
+    logerr "   purgedir <dir> - recursively does purgefile across all files under dir"
+    logerr "   purgefile <file> - removes file if it exists in the index at \"${INDEXROOT}\""
+    logerr "   timestamp <file> - display create time of file (best effort)"
+    logerr "   thumbnaildir <dir> - recursively does thumbnailfile across all files under dir"
+    logerr "   thumbnailfile <file> - thumbnails a file into \"${THUMBNAILROOT}\""
+}
+
+
+# This is an internal function to cache EXIF data.  EXIF data is expensive to
+# extract, we extract it only if it hasn't already been extracted, and export
+# it for use by subshells.
+function _read_exifdata() {
+    local filename="$1"
+
+    if [[ -z "${_EXIFDATA:-}" || "${filename}" != "${_EXIFFILE:-}" ]]
+    then
+        #echo "Actually reading EXIF data." 1>&2
+        _EXIFFILE="${filename}"
+        _EXIFDATA="$(exiftool -t -All -d '%Y-%m-%d %H:%M:%s' "${filename}" 2>/dev/null ||true)"
+        export _EXIFFILE _EXIFDATA
+    fi
+}
+
+
+# Prints all EXIF data for a file.
+function exifdata() {
+    local filename="$1"
+
+    _read_exifdata "${filename}"
+    echo "${_EXIFDATA}"
+}
+
+
+# Extracts an EXIF field from a file by name.
+function exiffield() {
+    local fieldname="$1"
+    local filename="$2"
+
+    exifdata "${filename}" |grep "^${fieldname}" |tail -1 |cut -f2
+}
+
+
+# Imports a media file into the index.
+function importfile() {
+    local filename="$1"
+    local mimetype="$(mimetype "${filename}")"
+
+    case "${mimetype}" in
+        "application/octet-stream")
+            # supports some video files
+            ;;
+        "image/jpeg")
+            ;;
+        "image/png")
+            ;;
+        "video/3gpp")
+            ;;
+        "video/mp2t")
+            ;;
+        "video/mp4")
+            ;;
+        "video/quicktime")
+            ;;
+        "video/x-msvideo")
+            ;;
+        *)
+            logop IMPORT_DECLINE_MIMETYPE "${filename}" "n/a"
+            return 1
+            ;;
+    esac
+
+    local indexloc="$(indexloc "${filename}")"
+
+    if [[ -f "${indexloc}" ]]
+    then
+        # Index entry already exists.
+
+        if cmp "${filename}" "${indexloc}" >/dev/null
+        then
+            # Files are the same, the import can be considered successful.
+            logop IMPORT_SUCCESS_DUPE "${filename}" "${indexloc}"
+            return 0
+        fi
+
+        cp -p --backup=numbered "${filename}" "${indexloc}"
+        logop IMPORT_SUCCESS_COLLIDE "${filename}" "${indexloc}"
+        return 0 
+    fi
+
+    mkdir -p "$(dirname "${indexloc}")"
+    # (still use --backup here for race conditions.)
+    cp -p --backup=numbered "${filename}" "${indexloc}"
+    logop IMPORT_SUCCESS_ORIG "${filename}" "${indexloc}"
+    return 0
+}
+
+
+# Prints the preferred index location of a given file.
+function indexloc() {
+    local filename="$1"
+    local ts="$(timestamp "${filename}")"
+    local day="$(echo "${ts}" |awk '{print $1}')"
+
+    echo "${INDEXROOT}/${day}/$(basename "${filename}")"
+}
+
+
+#Returns 0 (success) for a file that has been imported into the index.
+function isimported() {
+    local filename="$1"
+    local indexloc="$(indexloc "${filename}")"
+
+    if [[ ! -f "${filename}" ]]
+    then
+        return 1  #nonexistent files are not imported
+    fi
+
+    if [[ -f "${indexloc}" ]] && cmp "${filename}" "${indexloc}" >/dev/null
+    then
+        return 0  #imported
+    fi
+
+    # we're done if no backups are present
+    if ! stat ${indexloc}.* >/dev/null 2>&1
+    then
+        return 1  #no backups detected, not imported
+    fi
+
+    # test each backup
+    for f in ${indexloc}.*
+    do
+        if cmp "${filename}" "${f}" >/dev/null
+        then
+            #echo "found at backup \"$f\""
+            return 0  #imported (but exists as a backup)
+        fi
+    done
+
+    return 1  #not imported
+}
+
+
+# Prints the mime-type for a file.
+function mimetype() {
+    local filename="$1"
+
+    #NOTE: Optimization to do via a file suffix, as "file" and reading
+    # off of a shared drive are both fairly expensive.
+    local base="$(basename "${filename}")"
+    local ext="$([[ "${base}" = *.* ]] && echo "${base##*.}" || echo '')"
+    case "${ext}" in
+        "3GP"|"3gp")
+            echo "video/3gpp"
+            return 0
+            ;;
+        "AVI"|"avi")
+            echo "video/x-msvideo"
+            return 0
+            ;;
+        "JPG"|"jpg"|"jpeg")
+            echo "image/jpeg"
+            return 0
+            ;;
+        "MOV"|"mov")
+            echo "video/quicktime"
+            return 0
+            ;;
+        "MP4"|"mp4")
+            echo "video/mp4"
+            return 0
+            ;;
+        "MTS"|"mts")
+            echo "video/mp2t"
+            return 0
+            ;;
+        "PNG"|"png")
+            echo "image/png"
+            return 0
+            ;;
+    esac
+
+    # NOTE: not every system has mimetype. Fall-back if necessary to 'file'.
+    command mimetype --brief "${filename}" || file --brief --mime-type "${filename}"
+}
+
+
+# Deletes a file if it has been imported into the index.
+function purgefile() {
+    local filename="$1"
+
+    if ! isimported "${filename}"
+    then
+        echo "PURGE_OMIT_UNIMPORTED" "${filename}"
+        return 1
+    fi
+
+    local indexfilename="$(indexloc "${filename}")"
+
+    if [[ "$(readlink -m "${filename}")" == "$(readlink -m "${indexfilename}")" ]]
+    then
+        # If someone runs purgedir on INDEXROOT, skip any files which are where
+        # they should be upon import.  This will still allow deletions of any
+        # redundant files which are within INDEXROOT in additional locations
+        # aside from their proper indexloc() location.
+        echo "PURGE_OMIT_INDEX" "${filename}"
+        return 1
+    fi
+
+    rm -- "${filename}"
+    echo "PURGE_SUCCESS" "${filename}"
+    return 0
+}
+
+
+# Returns 0 (success) if the passed-in string is a valid EXIF timestamp.
+function is_valid_exif_timestamp() {
+    local ts="$1"
+
+    # Blanks are bogus
+    if [[ -z "${ts}" ]]
+    then
+        return 1  #invalid
+    fi
+
+    if [[ "${ts}" == "0000:00:00 00:00:00" ]]
+    then
+        return 1  #invalid
+    fi
+
+    if [[ "${ts}" == "0000:01:00 00:00:00" ]]
+    then
+        return 1  #invalid
+    fi
+
+    return 0  #valid
+}
+
+
+# e.g. "2016-05-17 14:53:1463511221" -> "2016-05-17 14:53:14" 
+function clean_exif_time() {
+    local ts_in="$1"
+    echo "${ts_in}" |cut -b1-19
+}
+
+
+# Derives a timestamp for a given file, in the format "2016-05-17 14:53:14"
+function timestamp() {
+    local filename="$1"
+    local ts="UNKNOWN"
+    local temp_ts
+
+    # Cache once to make the exiffield() calls cheap.
+    _read_exifdata "${filename}"
+
+    temp_ts="$(exiffield 'Create Date' "${filename}")"
+
+    if ! is_valid_exif_timestamp "${temp_ts}"
+    then
+        temp_ts="$(exiffield 'GPS Date/Time' "${filename}")"
+    fi
+
+    if ! is_valid_exif_timestamp "${temp_ts}"
+    then
+        temp_ts="$(exiffield 'Date/Time Original' "${filename}")"
+    fi
+
+    if ! is_valid_exif_timestamp "${temp_ts}"
+    then
+        temp_ts="$(exiffield 'File Modification Date/Time' "${filename}")"
+    fi
+
+    if is_valid_exif_timestamp "${temp_ts}"
+    then
+        ts="$(clean_exif_time "${temp_ts}")"
+    fi
+
+    echo "${ts}"
+}
+
+
+# Prints the preferred thumbnail location of a given (picture) file.
+function thumbnailloc() {
+    local filename="$(readlink -m "$1")"
+    local dir="$(dirname "${filename}")"
+    local base="$(basename "${filename}")"
+    local fileroot="${base%.*}"
+    local ext="$([[ "${base}" = *.* ]] && echo ".${base##*.}" || echo '')"
+    local day
+
+    if [[ "${filename}" == "${INDEXROOT}"* ]]
+    then
+        # File has an INDEXROOT prefix so extract day from directory which
+        # file exists in.
+        local stem="${filename#"${INDEXROOT}/"}"
+        day="$(dirname "${stem}")"
+    else
+        local ts="$(timestamp "${filename}")"
+        local day="$(echo "${ts}" |awk '{print $1}')"
+    fi
+
+    echo "${THUMBNAILROOT}/${day}_${fileroot}_thumb${ext}"
+}
+
+
+# Prints the preferred thumbnail location of a given (picture) file.
+function videothumbnailloc() {
+    local filename="$(readlink -m "$1")"
+    local dir="$(dirname "${filename}")"
+    local base="$(basename "${filename}")"
+    local fileroot="${base%.*}"
+    local ext="$([[ "${base}" = *.* ]] && echo ".${base##*.}" || echo '')"
+    local day
+
+    if [[ "${filename}" == "${INDEXROOT}"* ]]
+    then
+        # File has an INDEXROOT prefix so extract day from directory which
+        # file exists in.
+        local stem="${filename#"${INDEXROOT}/"}"
+        day="$(dirname "${stem}")"
+    else
+        local ts="$(timestamp "${filename}")"
+        local day="$(echo "${ts}" |awk '{print $1}')"
+    fi
+
+    echo "${THUMBNAILROOT}/${day}_${fileroot}_thumb.avi"
+}
+
+
+function thumbnailpicture() {
+    local filename="$(readlink -m "$1")"
+    local mimetype="$(mimetype "${filename}")"
+
+    # Only allow thumbnailing of files in the INDEXROOT.
+    if [[ "${filename}" != "${INDEXROOT}"* ]]
+    then
+            logop THUMBNAIL_DECLINE_UNIMPORTED "${filename}" "n/a"
+            return 1
+    fi
+
+    case "${mimetype}" in
+        "image/jpeg")
+            ;;
+        "image/png")
+            ;;
+        *)
+            logop THUMBNAIL_DECLINE_MIMETYPE "${filename}" "n/a"
+            return 1
+            ;;
+    esac
+
+    local thumbnailloc="$(thumbnailloc "${filename}")"
+
+    if [[ -s "${thumbnailloc}" ]]
+    then
+        # Thumbnail entry already exists.
+        logop THUMBNAIL_SUCCESS_COLLIDE "${filename}" "${thumbnailloc}"
+        return 0 
+    fi
+
+    mkdir -p "$(dirname "${thumbnailloc}")"
+    convert "${filename}" -resize 200x200 "${thumbnailloc}"
+    logop THUMBNAIL_SUCCESS_ORIG "${filename}" "${thumbnailloc}"
+    return 0
+}
+
+
+function thumbnailvideo() {
+    local filename="$(readlink -m "$1")"
+    local mimetype="$(mimetype "${filename}")"
+
+    # Only allow thumbnailing of files in the INDEXROOT.
+    if [[ "${filename}" != "${INDEXROOT}"* ]]
+    then
+            logop THUMBNAIL_DECLINE_UNIMPORTED "${filename}" "n/a"
+            return 1
+    fi
+
+    case "${mimetype}" in
+        "application/octet-stream")
+            # supports some video files
+            ;;
+        "video/3gpp")
+            ;;
+        "video/mp2t")
+            ;;
+        "video/mp4")
+            ;;
+        "video/quicktime")
+            ;;
+        "video/x-msvideo")
+            ;;
+        *)
+            logop THUMBNAIL_DECLINE_MIMETYPE "${filename}" "n/a"
+            return 1
+            ;;
+    esac
+
+    local videothumbnailloc="$(videothumbnailloc "${filename}")"
+    if [[ -s "${videothumbnailloc}" ]]
+    then
+        # Thumbnail entry already exists.
+        logop THUMBNAIL_SUCCESS_COLLIDE "${filename}" "${videothumbnailloc}"
+        return 0 
+    fi
+
+    mkdir -p "$(dirname "${videothumbnailloc}")"
+    #mpeg1video
+    ffmpeg -y -i "${filename}" -vcodec msmpeg4v2 -vf scale=320:-1 -an "${videothumbnailloc}" || ret=$?
+    if [[ ! -f "${videothumbnailloc}" || ! -s "${videothumbnailloc}" ]]
+    then
+        rm -f "${videothumbnailloc}"
+        logop THUMBNAIL_FAIL "${filename}" "${videothumbnailloc}"
+        return 1
+    fi
+
+    logop THUMBNAIL_SUCCESS_ORIG "${filename}" "${videothumbnailloc}"
+    return 0
+}
+
+
+# Thumbnails a picture file into the thumbnails index.
+function thumbnailfile() {
+    local filename="$(readlink -m "$1")"
+    local mimetype="$(mimetype "${filename}")"
+
+    # Only allow thumbnailing of files in the INDEXROOT.
+    if [[ "${filename}" != "${INDEXROOT}"* ]]
+    then
+            logop THUMBNAIL_DECLINE_UNIMPORTED "${filename}" "n/a"
+            return 1
+    fi
+
+    case "${mimetype}" in
+        "application/octet-stream")
+            # supports some video files
+            thumbnailvideo "${filename}"
+            ;;
+        "image/jpeg")
+            thumbnailpicture "${filename}"
+            ;;
+        "image/png")
+            thumbnailpicture "${filename}"
+            ;;
+        "video/3gpp")
+            thumbnailvideo "${filename}"
+            ;;
+        "video/mp2t")
+            thumbnailvideo "${filename}"
+            ;;
+        "video/mp4")
+            thumbnailvideo "${filename}"
+            ;;
+        "video/quicktime")
+            thumbnailvideo "${filename}"
+            ;;
+        "video/x-msvideo")
+            thumbnailvideo "${filename}"
+            ;;
+        *)
+            logop THUMBNAIL_DECLINE_MIMETYPE "${filename}" "n/a"
+            return 1
+            ;;
+    esac
+}
+
+
+shift
+case "${COMMAND}" in
+    exifdata)
+        exifdata "$@"
+        ;;
+    exiffield)
+        exiffield "$@"
+        ;;
+    exiftimes)
+        exiftool -time:all -G1 -a "$1"
+        ;;
+    indexloc)
+        indexloc "$@"
+        ;;
+    importdir)
+        find "$1" -type f -exec "${SCRIPTNAME}" importfile "{}" \;
+        ;;
+    importfile)
+        importfile "$@"
+        ;;
+    isimported)
+        isimported "$@"
+        ;;
+    mimetype)
+        mimetype "$@"
+        ;;
+    purgedir)
+        find "$1" -type f -exec "${SCRIPTNAME}" purgefile "{}" \;
+        ;;
+    purgefile)
+        purgefile "$@"
+        ;;
+    timestamp)
+        timestamp "$@"
+        ;;
+    thumbnailpicture)
+        thumbnailpicture"$@"
+        ;;
+    thumbnailvideo)
+        thumbnailvideo "$@"
+        ;;
+    thumbnailfile)
+        thumbnailfile "$@"
+        ;;
+    thumbnailloc)
+        thumbnailloc "$@"
+        ;;
+    thumbnaildir)
+        find "$1" -type f -exec "${SCRIPTNAME}" thumbnailfile "{}" \;
+        ;;
+    *)
+        printusage
+        exit
+        ;;
+esac
+
