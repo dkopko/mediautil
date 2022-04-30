@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#TODO - exiv2 instead of exiftool
+
 set -o errexit
 set -o nounset
 #set -o xtrace
@@ -7,10 +9,10 @@ set -o nounset
 SCRIPTNAME="$0"
 COMMAND="${1:-help}"
 
-#INDEXROOT="/home/daniel/Pictures"
+#INDEXROOT="/home/daniel/TempPictures"
 #INDEXROOT="/mnt/shared/DanPhonePictures"
-INDEXROOT="/mnt/shared/Pictures"
-THUMBNAILROOT="/mnt/shared/PicturesThumbnails"
+INDEXROOT="${INDEXROOT:-/mnt/shared/Pictures}"
+THUMBNAILROOT="${THUMBNAILROOT:-/mnt/shared/PicturesThumbnails}"
 
 function logerr() {
     echo "$@" 1>&2
@@ -87,6 +89,8 @@ function importfile() {
     case "${mimetype}" in
         "application/octet-stream")
             # supports some video files
+            ;;
+        "image/heif")
             ;;
         "image/jpeg")
             ;;
@@ -245,7 +249,7 @@ function purgefile() {
         return 1
     fi
 
-    rm -- "${filename}"
+    rm -f -- "${filename}"
     echo "PURGE_SUCCESS" "${filename}"
     return 0
 }
@@ -324,20 +328,23 @@ function thumbnailloc() {
     local base="$(basename "${filename}")"
     local fileroot="${base%.*}"
     local ext="$([[ "${base}" = *.* ]] && echo ".${base##*.}" || echo '')"
-    local day
+    local date
+    local year
 
     if [[ "${filename}" == "${INDEXROOT}"* ]]
     then
-        # File has an INDEXROOT prefix so extract day from directory which
+        # File has an INDEXROOT prefix so extract date from directory which
         # file exists in.
         local stem="${filename#"${INDEXROOT}/"}"
-        day="$(dirname "${stem}")"
+        date="$(dirname "${stem}")"
     else
         local ts="$(timestamp "${filename}")"
-        local day="$(echo "${ts}" |awk '{print $1}')"
+        local date="$(echo "${ts}" |awk '{print $1}')"
     fi
 
-    echo "${THUMBNAILROOT}/${day}_${fileroot}_thumb${ext}"
+    year="${date:0:4}"
+
+    echo "${THUMBNAILROOT}/${year}/${date}_${fileroot}_thumb${ext}"
 }
 
 
@@ -348,20 +355,23 @@ function videothumbnailloc() {
     local base="$(basename "${filename}")"
     local fileroot="${base%.*}"
     local ext="$([[ "${base}" = *.* ]] && echo ".${base##*.}" || echo '')"
-    local day
+    local date
+    local year
 
     if [[ "${filename}" == "${INDEXROOT}"* ]]
     then
         # File has an INDEXROOT prefix so extract day from directory which
         # file exists in.
         local stem="${filename#"${INDEXROOT}/"}"
-        day="$(dirname "${stem}")"
+        date="$(dirname "${stem}")"
     else
         local ts="$(timestamp "${filename}")"
-        local day="$(echo "${ts}" |awk '{print $1}')"
+        local date="$(echo "${ts}" |awk '{print $1}')"
     fi
 
-    echo "${THUMBNAILROOT}/${day}_${fileroot}_thumb.avi"
+    year="${date:0:4}"
+
+    echo "${THUMBNAILROOT}/${year}/${date}_${fileroot}_thumb.avi"
 }
 
 
@@ -397,8 +407,49 @@ function thumbnailpicture() {
     fi
 
     mkdir -p "$(dirname "${thumbnailloc}")"
-    convert "${filename}" -resize 200x200 "${thumbnailloc}"
+    convert "${filename}" -resize 800x800 "${thumbnailloc}"
     logop THUMBNAIL_SUCCESS_ORIG "${filename}" "${thumbnailloc}"
+    return 0
+}
+
+
+function thumbnailheif() {
+    local filename="$(readlink -m "$1")"
+    local mimetype="$(mimetype "${filename}")"
+
+    # Only allow thumbnailing of files in the INDEXROOT.
+    if [[ "${filename}" != "${INDEXROOT}"* ]]
+    then
+            logop THUMBNAIL_DECLINE_UNIMPORTED "${filename}" "n/a"
+            return 1
+    fi
+
+    case "${mimetype}" in
+        "image/heif")
+            ;;
+        *)
+            logop THUMBNAIL_DECLINE_MIMETYPE "${filename}" "n/a"
+            return 1
+            ;;
+    esac
+
+    local thumbnailloc="$(thumbnailloc "${filename}")"
+    local thumbnaillocjpg="${thumbnailloc%.*}.jpg"
+
+    if [[ -s "${thumbnailloc}" ]]
+    then
+        # Thumbnail entry already exists.
+        logop THUMBNAIL_SUCCESS_COLLIDE "${filename}" "${thumbnailloc}"
+        return 0
+    fi
+
+    #NOTE1: Prefer these to be converted to .jpg as well as resized, as HEIC/HEIF doesn't integrate well.
+    #NOTE2: heif-thumbnailer seems to have problems writing to /mnt/shared directly, so write to /tmp first.
+    mkdir -p "$(dirname "${thumbnaillocjpg}")"
+    local b="$(basename "${thumbnaillocjpg}")"
+    heif-thumbnailer "${filename}" -s 800 /tmp/"${b}"
+    mv /tmp/"${b}" "${thumbnaillocjpg}"
+    logop THUMBNAIL_SUCCESS_ORIG "${filename}" "${thumbnaillocjpg}"
     return 0
 }
 
@@ -473,6 +524,9 @@ function thumbnailfile() {
         "application/octet-stream")
             # supports some video files
             thumbnailvideo "${filename}"
+            ;;
+        "image/heif")
+            thumbnailheif "${filename}"
             ;;
         "image/jpeg")
             thumbnailpicture "${filename}"
