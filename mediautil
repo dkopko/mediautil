@@ -133,6 +133,7 @@ function importfile() {
     mkdir -p "$(dirname "${indexloc}")"
     # (still use --backup here for race conditions.)
     cp -p --backup=numbered "${filename}" "${indexloc}"
+    chmod 644 "${indexloc}"
     logop IMPORT_SUCCESS_ORIG "${filename}" "${indexloc}"
     return 0
 }
